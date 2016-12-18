@@ -131,15 +131,15 @@ public class CaptureModule implements CameraModule, PhotoController,
     /**
      * Camera state: Waiting for the focus to be locked.
      */
-    private static final int STATE_WAITING_LOCK = 1;
+    private static final int STATE_WAITING_AF_LOCK = 1;
     /**
      * Camera state: Waiting for the exposure to be precapture state.
      */
     private static final int STATE_WAITING_PRECAPTURE = 2;
     /**
-     * Camera state: Waiting for the exposure state to be something other than precapture.
+     * Camera state: Waiting for the exposure state to be locked.
      */
-    private static final int STATE_WAITING_NON_PRECAPTURE = 3;
+    private static final int STATE_WAITING_AE_LOCK = 3;
     /**
      * Camera state: Picture was taken.
      */
@@ -170,11 +170,16 @@ public class CaptureModule implements CameraModule, PhotoController,
     CaptureRequest.Key<Integer> BayerMonoLinkSessionIdKey =
             new CaptureRequest.Key<>("org.codeaurora.qcamera3.dualcam_link_meta_data" +
                     ".related_camera_id", Integer.class);
+    CaptureRequest.Key<Integer> CdsModeKey =
+            new CaptureRequest.Key<>("org.codeaurora.qcamera3.CDS.cds_mode", Integer.class);
     public static CaptureRequest.Key<Byte> JpegCropEnableKey =
             new CaptureRequest.Key<>("org.codeaurora.qcamera3.jpeg_encode_crop.enable",
                     Byte.class);
     public static CaptureRequest.Key<int[]> JpegCropRectKey =
             new CaptureRequest.Key<>("org.codeaurora.qcamera3.jpeg_encode_crop.rect",
+                    int[].class);
+    public static CaptureRequest.Key<int[]> JpegRoiRectKey =
+            new CaptureRequest.Key<>("org.codeaurora.qcamera3.jpeg_encode_crop.roi",
                     int[].class);
     public static CameraCharacteristics.Key<Byte> MetaDataMonoOnlyKey =
             new CameraCharacteristics.Key<>("org.codeaurora.qcamera3.sensor_meta_data.is_mono_only",
@@ -254,6 +259,8 @@ public class CaptureModule implements CameraModule, PhotoController,
     private Size mVideoPreviewSize;
     private Size mVideoSize;
     private Size mVideoSnapshotSize;
+    private Size mPictureThumbSize;
+    private Size mVideoSnapshotThumbSize;
 
     private MediaRecorder mMediaRecorder;
     private boolean mIsRecordingVideo;
@@ -357,7 +364,6 @@ public class CaptureModule implements CameraModule, PhotoController,
                         if (uri != null) {
                             mActivity.notifyNewMedia(uri);
                         }
-                        if (mLastJpegData != null) mActivity.updateThumbnail(mLastJpegData);
                     }
                 }
             };
@@ -482,7 +488,7 @@ public class CaptureModule implements CameraModule, PhotoController,
             mCameraOpened[id] = true;
 
             if (isBackCamera() && getCameraMode() == DUAL_MODE && id == BAYER_ID) {
-                Message msg = mCameraHandler.obtainMessage(OPEN_CAMERA, MONO_ID);
+                Message msg = mCameraHandler.obtainMessage(OPEN_CAMERA, MONO_ID, 0);
                 mCameraHandler.sendMessage(msg);
             } else {
                 mCamerasOpened = true;
@@ -535,10 +541,10 @@ public class CaptureModule implements CameraModule, PhotoController,
             case STATE_PREVIEW: {
                 break;
             }
-            case STATE_WAITING_LOCK: {
+            case STATE_WAITING_AF_LOCK: {
                 Integer afState = result.get(CaptureResult.CONTROL_AF_STATE);
                 Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
-                Log.d(TAG, "STATE_WAITING_LOCK id: " + id + " afState:" + afState + " aeState:" + aeState);
+                Log.d(TAG, "STATE_WAITING_AF_LOCK id: " + id + " afState:" + afState + " aeState:" + aeState);
                 // AF_PASSIVE is added for continous auto focus mode
                 if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState ||
                         CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState ||
@@ -546,37 +552,55 @@ public class CaptureModule implements CameraModule, PhotoController,
                         CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED == afState ||
                         (mLockRequestHashCode[id] == result.getRequest().hashCode() &&
                                 afState == CaptureResult.CONTROL_AF_STATE_INACTIVE)) {
-                    // CONTROL_AE_STATE can be null on some devices
-                    if (aeState == null || (aeState == CaptureResult
-                            .CONTROL_AE_STATE_CONVERGED) && isFlashOff(id)) {
-                        checkAfAeStatesAndCapture(id);
+                    if(id == MONO_ID && getCameraMode() == DUAL_MODE && isBackCamera()) {
+                        // in dual mode, mono AE dictated by bayer AE.
+                        // if not already locked, wait for lock update from bayer
+                        if(aeState == CaptureResult.CONTROL_AE_STATE_LOCKED)
+                            checkAfAeStatesAndCapture(id);
+                        else
+                            mState[id] = STATE_WAITING_AE_LOCK;
                     } else {
                         runPrecaptureSequence(id);
+                        // CONTROL_AE_STATE can be null on some devices
+                        if(aeState == null || (aeState == CaptureResult
+                                .CONTROL_AE_STATE_CONVERGED) && isFlashOff(id)) {
+                            lockExposure(id);
+                        } else {
+                            runPrecaptureSequence(id);
+                        }
                     }
                 }
                 break;
             }
             case STATE_WAITING_PRECAPTURE: {
                 // CONTROL_AE_STATE can be null on some devices
+                Integer afState = result.get(CaptureResult.CONTROL_AF_STATE);
                 Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
-                Log.d(TAG, "STATE_WAITING_PRECAPTURE id: " + id + " aeState:" + aeState);
+                Log.d(TAG, "STATE_WAITING_PRECAPTURE id: " + id + " afState: " + afState + " aeState:" + aeState);
                 if (aeState == null ||
                         aeState == CaptureResult.CONTROL_AE_STATE_PRECAPTURE ||
                         aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
                         aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
                     if (mPrecaptureRequestHashCode[id] == result.getRequest().hashCode())
-                        mState[id] = STATE_WAITING_NON_PRECAPTURE;
+                        lockExposure(id);
                 }
                 break;
             }
-            case STATE_WAITING_NON_PRECAPTURE: {
+            case STATE_WAITING_AE_LOCK: {
                 // CONTROL_AE_STATE can be null on some devices
+                Integer afState = result.get(CaptureResult.CONTROL_AF_STATE);
                 Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
-                Log.d(TAG, "STATE_WAITING_NON_PRECAPTURE id: " + id + " aeState:" + aeState);
-                if (aeState == null || aeState != CaptureResult.CONTROL_AE_STATE_PRECAPTURE) {
+                Log.d(TAG, "STATE_WAITING_AE_LOCK id: " + id + " afState: " + afState + " aeState:" + aeState);
+                if (aeState == null || aeState == CaptureResult.CONTROL_AE_STATE_LOCKED) {
                     checkAfAeStatesAndCapture(id);
                 }
                 break;
+            }
+            case STATE_AF_AE_LOCKED: {
+                    Integer afState = result.get(CaptureResult.CONTROL_AF_STATE);
+                    Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+                    Log.d(TAG, "STATE_AF_AE_LOCKED id: " + id + " afState:" + afState + " aeState:" + aeState);
+                    break;
             }
             case STATE_WAITING_TOUCH_FOCUS:
                 break;
@@ -586,6 +610,16 @@ public class CaptureModule implements CameraModule, PhotoController,
     private void checkAfAeStatesAndCapture(int id) {
         if(isBackCamera() && getCameraMode() == DUAL_MODE) {
             mState[id] = STATE_AF_AE_LOCKED;
+            try {
+                // stop repeating request once we have AF/AE lock
+                // for mono when mono preview is off.
+                if(id == MONO_ID && !canStartMonoPreview()) {
+                    mCaptureSession[id].stopRepeating();
+                }
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+
             if(mState[BAYER_ID] == STATE_AF_AE_LOCKED &&
                     mState[MONO_ID] == STATE_AF_AE_LOCKED) {
                 mState[BAYER_ID] = STATE_PICTURE_TAKEN;
@@ -902,7 +936,7 @@ public class CaptureModule implements CameraModule, PhotoController,
     @Override
     public void init(CameraActivity activity, View parent) {
         mActivity = activity;
-        mSettingsManager = SettingsManager.getInstance();
+        mSettingsManager = activity.getSettingsManager();
         mSettingsManager.registerListener(this);
         mSettingsManager.init();
         mFirstPreviewLoaded = false;
@@ -965,10 +999,21 @@ public class CaptureModule implements CameraModule, PhotoController,
         }
         Log.d(TAG, "lockFocus " + id);
 
+        try {
+            // start repeating request to get AF/AE state updates
+            // for mono when mono preview is off.
+            if(id == MONO_ID && !canStartMonoPreview()) {
+                mCaptureSession[id].setRepeatingRequest(mPreviewRequestBuilder[id]
+                        .build(), mCaptureCallback, mCameraHandler);
+            }
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+
         mTakingPicture[id] = true;
         if (mState[id] == STATE_WAITING_TOUCH_FOCUS) {
-            mCameraHandler.removeMessages(CANCEL_TOUCH_FOCUS, id);
-            mState[id] = STATE_WAITING_LOCK;
+            mCameraHandler.removeMessages(CANCEL_TOUCH_FOCUS, mCameraId[id]);
+            mState[id] = STATE_WAITING_AF_LOCK;
             return;
         }
 
@@ -981,7 +1026,7 @@ public class CaptureModule implements CameraModule, PhotoController,
             applySettingsForLockFocus(builder, id);
             CaptureRequest request = builder.build();
             mLockRequestHashCode[id] = request.hashCode();
-            mState[id] = STATE_WAITING_LOCK;
+            mState[id] = STATE_WAITING_AF_LOCK;
             mCaptureSession[id].capture(request, mCaptureCallback, mCameraHandler);
         } catch (CameraAccessException e) {
             e.printStackTrace();
@@ -1005,7 +1050,7 @@ public class CaptureModule implements CameraModule, PhotoController,
             mState[id] = STATE_WAITING_TOUCH_FOCUS;
             mCaptureSession[id].capture(builder.build(), mCaptureCallback, mCameraHandler);
             setAFModeToPreview(id, mControlAFMode);
-            Message message = mCameraHandler.obtainMessage(CANCEL_TOUCH_FOCUS, id);
+            Message message = mCameraHandler.obtainMessage(CANCEL_TOUCH_FOCUS, mCameraId[id]);
             mCameraHandler.sendMessageDelayed(message, CANCEL_TOUCH_FOCUS_DELAY);
         } catch (CameraAccessException e) {
             e.printStackTrace();
@@ -1076,11 +1121,24 @@ public class CaptureModule implements CameraModule, PhotoController,
                 captureBuilder = mCameraDevice[id].createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             }
 
+            Location location = mLocationManager.getCurrentLocation();
+            if(location != null) {
+                Log.d(TAG, "captureStillPicture gps: " + location.toString());
+                // workaround for Google bug. Need to convert timestamp from ms -> sec
+                location.setTime(location.getTime()/1000);
+                captureBuilder.set(CaptureRequest.JPEG_GPS_LOCATION, location);
+            } else {
+                Log.d(TAG, "captureStillPicture no location - getRecordLocation: " + getRecordLocation());
+            }
             captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, CameraUtil.getJpegRotation(id, mOrientation));
+            captureBuilder.set(CaptureRequest.JPEG_THUMBNAIL_SIZE, mPictureThumbSize);
+            captureBuilder.set(CaptureRequest.JPEG_THUMBNAIL_QUALITY, (byte)80);
             captureBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
             addPreviewSurface(captureBuilder, null, id);
             captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, mControlAFMode);
             captureBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE);
+            captureBuilder.set(CdsModeKey, 2); // CDS 0-OFF, 1-ON, 2-AUTO
+            applySettingsForLockExposure(captureBuilder, id);
             applySettingsForCapture(captureBuilder, id);
 
             if(csEnabled) {
@@ -1196,6 +1254,8 @@ public class CaptureModule implements CameraModule, PhotoController,
                     mCameraDevice[id].createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT);
 
             captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, CameraUtil.getJpegRotation(id, mOrientation));
+            captureBuilder.set(CaptureRequest.JPEG_THUMBNAIL_SIZE, mVideoSnapshotThumbSize);
+            captureBuilder.set(CaptureRequest.JPEG_THUMBNAIL_QUALITY, (byte)80);
             applyVideoSnapshot(captureBuilder, id);
 
             captureBuilder.addTarget(mVideoSnapshotImageReader.getSurface());
@@ -1234,7 +1294,7 @@ public class CaptureModule implements CameraModule, PhotoController,
      * we get a response in {@link #mCaptureCallback} from {@link #lockFocus()}.
      */
     private void runPrecaptureSequence(int id) {
-        Log.d(TAG, "runPrecaptureSequence");
+        Log.d(TAG, "runPrecaptureSequence: " + id);
         try {
             CaptureRequest.Builder builder = mCameraDevice[id].createCaptureRequest(CameraDevice
                     .TEMPLATE_PREVIEW);
@@ -1285,7 +1345,7 @@ public class CaptureModule implements CameraModule, PhotoController,
 
                 if (isClearSightOn()) {
                     if(i == getMainCameraId()) {
-                        ClearSightImageProcessor.getInstance().init(mPictureSize.getWidth(),
+                        ClearSightImageProcessor.getInstance().init(map, mPictureSize.getWidth(),
                                 mPictureSize.getHeight(), mActivity, mOnMediaSavedListener);
                         ClearSightImageProcessor.getInstance().setCallback(this);
                     }
@@ -1314,7 +1374,6 @@ public class CaptureModule implements CameraModule, PhotoController,
                                     long date = (name == null) ? -1 : name.date;
 
                                     byte[] bytes = getJpegData(image);
-                                    mLastJpegData = bytes;
 
                                     ExifInterface exif = Exif.getExif(bytes);
                                     int orientation = Exif.getOrientation(exif);
@@ -1322,6 +1381,12 @@ public class CaptureModule implements CameraModule, PhotoController,
                                     mActivity.getMediaSaveService().addImage(bytes, title, date,
                                             null, image.getWidth(), image.getHeight(), orientation, null,
                                             mOnMediaSavedListener, mContentResolver, "jpeg");
+
+                                    if(mLongshotActive) {
+                                        mLastJpegData = bytes;
+                                    } else {
+                                        mActivity.updateThumbnail(bytes);
+                                    }
                                     image.close();
                                 }
                             }
@@ -1356,7 +1421,6 @@ public class CaptureModule implements CameraModule, PhotoController,
 
                         ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                         byte[] bytes = new byte[buffer.remaining()];
-                        mLastJpegData = bytes;
                         buffer.get(bytes);
 
                         ExifInterface exif = Exif.getExif(bytes);
@@ -1365,6 +1429,8 @@ public class CaptureModule implements CameraModule, PhotoController,
                         mActivity.getMediaSaveService().addImage(bytes, title, date,
                                 null, image.getWidth(), image.getHeight(), orientation, null,
                                 mOnMediaSavedListener, mContentResolver, "jpeg");
+
+                        mActivity.updateThumbnail(bytes);
                         image.close();
                     }
                 }, mImageAvailableHandler);
@@ -1385,23 +1451,27 @@ public class CaptureModule implements CameraModule, PhotoController,
             applySettingsForUnlockFocus(builder, id);
             mCaptureSession[id].capture(builder.build(), mCaptureCallback, mCameraHandler);
             mState[id] = STATE_PREVIEW;
-            mControlAFMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
-            setAFModeToPreview(id, mControlAFMode);
-            if(id == MONO_ID && !canStartMonoPreview()) {
-                mCaptureSession[id].capture(mPreviewRequestBuilder[id]
-                        .build(), mCaptureCallback, mCameraHandler);
-            } else {
-                mCaptureSession[id].setRepeatingRequest(mPreviewRequestBuilder[id].build(),
-                        mCaptureCallback, mCameraHandler);
+            if (id == getMainCameraId()) {
+                mActivity.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        mUI.clearFocus();
+                    }
+                });
             }
+            mControlAFMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
+            applySettingsForUnlockExposure(mPreviewRequestBuilder[id], id);
+            setAFModeToPreview(id, mControlAFMode);
             mTakingPicture[id] = false;
-            mActivity.runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    mUI.stopSelfieFlash();
-                    mUI.enableShutter(true);
-                }
-            });
+            if (id == getMainCameraId()) {
+                mActivity.runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        mUI.stopSelfieFlash();
+                        mUI.enableShutter(true);
+                    }
+                });
+            }
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -1427,56 +1497,64 @@ public class CaptureModule implements CameraModule, PhotoController,
             mFrameProcessor.onClose();
         }
 
-        for (int i = 0; i < MAX_NUM_CAM; i++) {
-            if (null != mCaptureSession[i]) {
-                if (mIsLinked && mCamerasOpened) {
-                    unLinkBayerMono(i);
-                    try {
-                        mCaptureSession[i].capture(mPreviewRequestBuilder[i].build(), null,
-                                mCameraHandler);
-                    } catch (CameraAccessException e) {
-                        e.printStackTrace();
-                    }
-                }
-                mCaptureSession[i].close();
-                mCaptureSession[i] = null;
-            }
-
-            if (null != mImageReader[i]) {
-                mImageReader[i].close();
-                mImageReader[i] = null;
-            }
-        }
         /* no need to set this in the callback and handle asynchronously. This is the same
         reason as why we release the semaphore here, not in camera close callback function
         as we don't have to protect the case where camera open() gets called during camera
         close(). The low level framework/HAL handles the synchronization for open()
         happens after close() */
-        mIsLinked = false;
 
         try {
-            mCameraOpenCloseLock.acquire();
-            for (int i = 0; i < MAX_NUM_CAM; i++) {
+            // Close camera starting with AUX first
+            for (int i = MAX_NUM_CAM-1; i >= 0; i--) {
                 if (null != mCameraDevice[i]) {
+                    if (!mCameraOpenCloseLock.tryAcquire(2000, TimeUnit.MILLISECONDS)) {
+                        Log.d(TAG, "Time out waiting to lock camera closing.");
+                        throw new RuntimeException("Time out waiting to lock camera closing");
+                    }
+                    Log.d(TAG, "Closing camera: " + mCameraDevice[i].getId());
                     mCameraDevice[i].close();
                     mCameraDevice[i] = null;
                     mCameraOpened[i] = false;
-                }
-                if (null != mMediaRecorder) {
-                    mMediaRecorder.release();
-                    mMediaRecorder = null;
+                    mCaptureSession[i] = null;
                 }
 
-                if (null != mVideoSnapshotImageReader) {
-                    mVideoSnapshotImageReader.close();
-                    mVideoSnapshotImageReader = null;
+                if (null != mImageReader[i]) {
+                    mImageReader[i].close();
+                    mImageReader[i] = null;
                 }
+            }
+
+            mIsLinked = false;
+
+            if (null != mMediaRecorder) {
+                mMediaRecorder.release();
+                mMediaRecorder = null;
+            }
+
+            if (null != mVideoSnapshotImageReader) {
+                mVideoSnapshotImageReader.close();
+                mVideoSnapshotImageReader = null;
             }
         } catch (InterruptedException e) {
             mCameraOpenCloseLock.release();
             throw new RuntimeException("Interrupted while trying to lock camera closing.", e);
         } finally {
             mCameraOpenCloseLock.release();
+        }
+    }
+
+    /**
+     * Lock the exposure for capture
+     */
+    private void lockExposure(int id) {
+        Log.d(TAG, "lockExposure: " + id);
+        try {
+            applySettingsForLockExposure(mPreviewRequestBuilder[id], id);
+            mState[id] = STATE_WAITING_AE_LOCK;
+            mCaptureSession[id].setRepeatingRequest(mPreviewRequestBuilder[id].build(),
+                    mCaptureCallback, mCameraHandler);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
         }
     }
 
@@ -1499,6 +1577,14 @@ public class CaptureModule implements CameraModule, PhotoController,
                 CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START);
         applyCommonSettings(builder, id);
         applyFaceDetect(builder, id);
+    }
+
+    private void applySettingsForLockExposure(CaptureRequest.Builder builder, int id) {
+        builder.set(CaptureRequest.CONTROL_AE_LOCK, Boolean.TRUE);
+    }
+
+    private void applySettingsForUnlockExposure(CaptureRequest.Builder builder, int id) {
+        builder.set(CaptureRequest.CONTROL_AE_LOCK, Boolean.FALSE);
     }
 
     private void applySettingsForUnlockFocus(CaptureRequest.Builder builder, int id) {
@@ -1650,6 +1736,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         mUI.hideSurfaceView();
         mFirstPreviewLoaded = false;
         stopBackgroundThread();
+        mLastJpegData = null;
     }
 
     @Override
@@ -1795,17 +1882,16 @@ public class CaptureModule implements CameraModule, PhotoController,
             switch (getCameraMode()) {
                 case DUAL_MODE:
                 case BAYER_MODE:
-                    msg.obj = BAYER_ID;
+                    msg.arg1 = BAYER_ID;
                     mCameraHandler.sendMessage(msg);
                     break;
                 case MONO_MODE:
-                    msg.what = OPEN_CAMERA;
-                    msg.obj = MONO_ID;
+                    msg.arg1 = MONO_ID;
                     mCameraHandler.sendMessage(msg);
                     break;
             }
         } else {
-            msg.obj = FRONT_ID;
+            msg.arg1 = FRONT_ID;
             mCameraHandler.sendMessage(msg);
         }
         if (!mFirstTimeInitialized) {
@@ -1884,6 +1970,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         } else {
             applyZoomAndUpdate(FRONT_ID);
         }
+        mUI.updateFaceViewCameraBound(mCropRegion[getMainCameraId()]);
     }
 
     private boolean isInMode(int cameraId) {
@@ -2173,6 +2260,8 @@ public class CaptureModule implements CameraModule, PhotoController,
         Size[] prevSizes = mSettingsManager.getSupportedOutputSize(getMainCameraId(),
                 SurfaceHolder.class);
         mPreviewSize = getOptimalPreviewSize(mPictureSize, prevSizes, screenSize.x, screenSize.y);
+        Size[] thumbSizes = mSettingsManager.getSupportedThumbnailSizes(getMainCameraId());
+        mPictureThumbSize = getOptimalPreviewSize(mPictureSize, thumbSizes, 0, 0); // get largest thumb size
     }
 
     public boolean isRecordingVideo() {
@@ -2209,6 +2298,8 @@ public class CaptureModule implements CameraModule, PhotoController,
         } else {
             mVideoSnapshotSize = mPictureSize;
         }
+        Size[] thumbSizes = mSettingsManager.getSupportedThumbnailSizes(getMainCameraId());
+        mVideoSnapshotThumbSize = getOptimalPreviewSize(mVideoSnapshotSize, thumbSizes, 0, 0); // get largest thumb size
     }
 
     private void updateMaxVideoDuration() {
@@ -2232,7 +2323,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         mMediaRecorderPausing = false;
         mUI.hideUIwhileRecording();
         mUI.clearFocus();
-        mCameraHandler.removeMessages(CANCEL_TOUCH_FOCUS, cameraId);
+        mCameraHandler.removeMessages(CANCEL_TOUCH_FOCUS, mCameraId[cameraId]);
         mState[cameraId] = STATE_PREVIEW;
         mControlAFMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
         closePreviewSession();
@@ -3063,8 +3154,17 @@ public class CaptureModule implements CameraModule, PhotoController,
         int height = p.y;
         mAFRegions[id] = afaeRectangle(x, y, width, height, 1f, mCropRegion[id]);
         mAERegions[id] = afaeRectangle(x, y, width, height, 1.5f, mCropRegion[id]);
-        mCameraHandler.removeMessages(CANCEL_TOUCH_FOCUS, id);
+        mCameraHandler.removeMessages(CANCEL_TOUCH_FOCUS, mCameraId[id]);
         autoFocusTrigger(id);
+    }
+
+    private void cancelTouchFocus(int id) {
+        if(mPaused)
+            return;
+
+        mState[id] = STATE_PREVIEW;
+        mControlAFMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
+        setAFModeToPreview(id, mControlAFMode);
     }
 
     private MeteringRectangle[] afaeRectangle(float x, float y, int width, int height,
@@ -3341,20 +3441,6 @@ public class CaptureModule implements CameraModule, PhotoController,
         return mUI.getTrackingFocusRenderer();
     }
 
-    /**
-     * Compares two {@code Size}s based on their areas.
-     */
-    static class CompareSizesByArea implements Comparator<Size> {
-
-        @Override
-        public int compare(Size lhs, Size rhs) {
-            // We cast here to ensure the multiplications won't overflow
-            return Long.signum((long) lhs.getWidth() * lhs.getHeight() -
-                    (long) rhs.getWidth() * rhs.getHeight());
-        }
-
-    }
-
     private class MyCameraHandler extends Handler {
 
         public MyCameraHandler(Looper looper) {
@@ -3363,15 +3449,13 @@ public class CaptureModule implements CameraModule, PhotoController,
 
         @Override
         public void handleMessage(Message msg) {
-            int id = (int) msg.obj;
+            int id = msg.arg1;
             switch (msg.what) {
                 case OPEN_CAMERA:
                     openCamera(id);
                     break;
                 case CANCEL_TOUCH_FOCUS:
-                    mState[id] = STATE_PREVIEW;
-                    mControlAFMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
-                    setAFModeToPreview(id, mControlAFMode);
+                    cancelTouchFocus(id);
                     break;
             }
         }
@@ -3424,13 +3508,14 @@ public class CaptureModule implements CameraModule, PhotoController,
             byte[] bayerBytes = getJpegData(bayerImage);
             byte[] monoBytes = getJpegData(monoImage);
 
-            mLastJpegData = bayerBytes;
             ExifInterface exif = Exif.getExif(bayerBytes);
             int orientation = Exif.getOrientation(exif);
 
             mActivity.getMediaSaveService().addMpoImage(
                     null, bayerBytes, monoBytes, width, height, title,
                     date, null, orientation, mOnMediaSavedListener, mContentResolver, "jpeg");
+
+            mActivity.updateThumbnail(bayerBytes);
 
             bayerImage.close();
             bayerImage = null;
@@ -3441,8 +3526,16 @@ public class CaptureModule implements CameraModule, PhotoController,
     }
 
     @Override
-    public void onClearSightSuccess() {
+    public void onReleaseShutterLock() {
+        Log.d(TAG, "onReleaseShutterLock");
+        unlockFocus(BAYER_ID);
+        unlockFocus(MONO_ID);
+    }
+
+    @Override
+    public void onClearSightSuccess(byte[] thumbnailBytes) {
         Log.d(TAG, "onClearSightSuccess");
+        if(thumbnailBytes != null) mActivity.updateThumbnail(thumbnailBytes);
         mActivity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -3450,14 +3543,12 @@ public class CaptureModule implements CameraModule, PhotoController,
                         Toast.LENGTH_SHORT).show();
             }
         });
-
-        unlockFocus(BAYER_ID);
-        unlockFocus(MONO_ID);
     }
 
     @Override
-    public void onClearSightFailure() {
+    public void onClearSightFailure(byte[] thumbnailBytes) {
         Log.d(TAG, "onClearSightFailure");
+        if(thumbnailBytes != null) mActivity.updateThumbnail(thumbnailBytes);
         mActivity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
