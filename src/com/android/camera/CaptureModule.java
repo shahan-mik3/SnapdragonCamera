@@ -516,8 +516,6 @@ public class CaptureModule implements CameraModule, PhotoController,
         public void onError(CameraDevice cameraDevice, int error) {
             int id = Integer.parseInt(cameraDevice.getId());
             Log.e(TAG, "onError " + id + " " + error);
-            cameraDevice.close();
-            mCameraDevice[id] = null;
             mCameraOpenCloseLock.release();
             mCamerasOpened = false;
             if (null != mActivity) {
@@ -548,8 +546,6 @@ public class CaptureModule implements CameraModule, PhotoController,
                 // AF_PASSIVE is added for continous auto focus mode
                 if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState ||
                         CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState ||
-                        CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED == afState ||
-                        CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED == afState ||
                         (mLockRequestHashCode[id] == result.getRequest().hashCode() &&
                                 afState == CaptureResult.CONTROL_AF_STATE_INACTIVE)) {
                     if(id == MONO_ID && getCameraMode() == DUAL_MODE && isBackCamera()) {
@@ -631,6 +627,11 @@ public class CaptureModule implements CameraModule, PhotoController,
             mState[id] = STATE_PICTURE_TAKEN;
             captureStillPicture(id);
         }
+    }
+
+    public void unRegisterSettingsListener(){
+        mSettingsManager.unregisterListener(this);
+        mSettingsManager.unregisterListener(mUI);
     }
 
     public void startFaceDetection() {
@@ -895,8 +896,13 @@ public class CaptureModule implements CameraModule, PhotoController,
         applyAERegions(mPreviewRequestBuilder[id], id);
         mPreviewRequestBuilder[id].setTag(id);
         try {
-            mCaptureSession[id].setRepeatingRequest(mPreviewRequestBuilder[id]
-                    .build(), mCaptureCallback, mCameraHandler);
+            if(id == MONO_ID && !canStartMonoPreview()) {
+                mCaptureSession[id].capture(mPreviewRequestBuilder[id]
+                        .build(), mCaptureCallback, mCameraHandler);
+            } else {
+                mCaptureSession[id].setRepeatingRequest(mPreviewRequestBuilder[id]
+                        .build(), mCaptureCallback, mCameraHandler);
+            }
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
@@ -920,7 +926,7 @@ public class CaptureModule implements CameraModule, PhotoController,
 
     public void reinit() {
         setCurrentMode();
-        mSettingsManager.reinit(getMainCameraId());
+        mSettingsManager.init();
     }
 
     public boolean isRefocus() {
@@ -1050,7 +1056,8 @@ public class CaptureModule implements CameraModule, PhotoController,
             mState[id] = STATE_WAITING_TOUCH_FOCUS;
             mCaptureSession[id].capture(builder.build(), mCaptureCallback, mCameraHandler);
             setAFModeToPreview(id, mControlAFMode);
-            Message message = mCameraHandler.obtainMessage(CANCEL_TOUCH_FOCUS, mCameraId[id]);
+            Message message = mCameraHandler.obtainMessage(
+                    CANCEL_TOUCH_FOCUS, Integer.valueOf(mCameraId[id]), 0);
             mCameraHandler.sendMessageDelayed(message, CANCEL_TOUCH_FOCUS_DELAY);
         } catch (CameraAccessException e) {
             e.printStackTrace();
@@ -1123,10 +1130,12 @@ public class CaptureModule implements CameraModule, PhotoController,
 
             Location location = mLocationManager.getCurrentLocation();
             if(location != null) {
-                Log.d(TAG, "captureStillPicture gps: " + location.toString());
+                // make copy so that we don't alter the saved location since we may re-use it
+                location = new Location(location);
                 // workaround for Google bug. Need to convert timestamp from ms -> sec
                 location.setTime(location.getTime()/1000);
                 captureBuilder.set(CaptureRequest.JPEG_GPS_LOCATION, location);
+                Log.d(TAG, "captureStillPicture gps: " + location.toString());
             } else {
                 Log.d(TAG, "captureStillPicture no location - getRecordLocation: " + getRecordLocation());
             }
@@ -1750,6 +1759,7 @@ public class CaptureModule implements CameraModule, PhotoController,
             mState[i] = STATE_PREVIEW;
         }
         mLongshotActive = false;
+        mZoomValue = 1.0f;
     }
 
     private void setCurrentMode() {
